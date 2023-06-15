@@ -220,7 +220,7 @@ function Get-O365Data{
             $response = Invoke-WebRequest -Method GET -Headers $headerParams -Uri $listAvailableContentUri
             if($response.StatusCode -eq 200){
                 $contentResult = ConvertFrom-Json $response.Content
-                $contentResult.Count
+                Write-Information -Message "Content Count = $($contentResult.Count)"
                 if($contentResult.Count -gt 0){
                     $jobs += $contentResult | Start-ThreadJob -ScriptBlock {
                         $getTokenFunc, $updateTokenFunc, $writeOmsLogFileFunc = $using:functionsDef
@@ -235,7 +235,7 @@ function Get-O365Data{
                             $headerParams_inner, $expiresOn_inner = Update-AuthToken $headerParams_inner $expiresOn_inner $env:clientID $env:clientSecret $env:domain $env:tenantGuid
                             $data = Invoke-RestMethod -Method GET -Headers $headerParams_inner -Uri ($obj.contentUri)
                             #$data.Count
-                            Write-Information -Message "Count = $data.Count"
+                            Write-Information -Message "Record Count = $($data.Count)"
                             #Loop through each Record in the Content
                             foreach($event in $data){
                                 #Filtering for Recrord types
