@@ -156,9 +156,43 @@ function Get-AuthToken{
     # auth
     $body = @{grant_type="client_credentials";resource=$resource;client_id=$ClientID;client_secret=$ClientSecret}
     $oauth = Invoke-RestMethod -Method Post -Uri $loginURL/$tenantdomain/oauth2/token?api-version=1.0 -Body $body
+    $currentTime = [int](Get-Date -Date ([DateTime]::UtcNow) -UFormat %s)
     $headerParams = @{'Authorization'="$($oauth.token_type) $($oauth.access_token)"}
-    return $headerParams 
+    $expires_on = $currentTime + [int]($oauth.expires_in)
+    return $headerParams, $expires_on
 }
+
+function Update-AuthToken{
+    [cmdletbinding()]
+        Param(
+            [Parameter(Mandatory = $true, Position = 0)]
+            [psobject]$HeaderParams,
+            [Parameter(Mandatory = $true, Position = 1)]
+            [string]$ExpiresOn,
+            [Parameter(Mandatory = $true, Position = 2)]
+            [string]$ClientID,
+            [parameter(Mandatory = $true, Position = 3)]
+            [string]$ClientSecret,
+            [Parameter(Mandatory = $true, Position = 4)]
+            [string]$tenantdomain,
+            [Parameter(Mandatory = $true, Position = 5)]
+            [string]$TenantGUID
+        )
+    $currentTime = [int](Get-Date -Date ([DateTime]::UtcNow) -UFormat %s)
+    if ($ExpiresOn -lt $currentTime) {
+        # Write-Host "Expired: " $currentTime $ExpiresOn
+        return Get-AuthToken $clientID $clientSecret $tenantdomain $tenantGuid
+    } else {
+        # Write-Host "Not Expired: " $currentTime  $ExpiresOn
+        return $HeaderParams, $ExpiresOn
+    }
+}
+
+$functionsDef = $(
+    ${function:Get-AuthToken}.ToString()
+    ${function:Update-AuthToken}.ToString()
+    ${function:Write-OMSLogfile}.ToString()
+)
 
 function Get-O365Data{
     [cmdletbinding()]
@@ -170,59 +204,79 @@ function Get-O365Data{
         [Parameter(Mandatory = $true, Position = 2)]
         [psobject]$headerParams,
         [parameter(Mandatory = $true, Position = 3)]
-        [string]$tenantGuid
+        [string]$tenantGuid,
+        [parameter(Mandatory = $true, Position = 4)]
+        [int]$expiresOn
     )
     #List Available Content
     $contentTypes = $env:contentTypes.split(",")
     #Loop for each content Type like Audit.General
+    $jobs = @()
     foreach($contentType in $contentTypes){
         $listAvailableContentUri = "https://manage.office.com/api/v1.0/$tenantGUID/activity/feed/subscriptions/content?contentType=$contentType&PublisherIdentifier=$env:publisher&startTime=$startTime&endTime=$endTime"
         do {
             #List Available Content
-            $contentResult = Invoke-RestMethod -Method GET -Headers $headerParams -Uri $listAvailableContentUri
-            $contentResult.Count
-            #Loop for each Content
-            foreach($obj in $contentResult){
-                #Retrieve Content
-                $data = Invoke-RestMethod -Method GET -Headers $headerParams -Uri ($obj.contentUri)
-                $data.Count
-                #Loop through each Record in the Content
-                foreach($event in $data){
-                    #Filtering for Recrord types
-                    #Get all Record Types
-                    if($env:recordTypes -eq "0"){
-                        #We dont need Cloud App Security Alerts due to MCAS connector
-                        if(($event.Source) -ne "Cloud App Security"){
-                            #Write each event to Log A
-                            $writeResult = Write-OMSLogfile (Get-Date) $env:customLogName $event $env:workspaceId $env:workspaceKey
-                            #$writeResult
-                        }
-                    }
-                    else{
-                        #Get only certain record types
-                        $types = ($env:recordTypes).split(",")
-                        if(($event.RecordType) -in $types){
-                            #We dont need Cloud App Security Alerts due to MCAS connector
-                            if(($event.Source) -ne "Cloud App Security"){
-                                #write each event to Log A
-                                $writeResult = Write-OMSLogfile (Get-Date) $env:customLogName $event $env:workspaceId $env:workspaceKey
-                                #$writeResult
+            $headerParams, $expiresOn = Update-AuthToken $headerParams $expiresOn $env:clientID $env:clientSecret $env:domain $env:tenantGuid
+            $response = Invoke-WebRequest -Method GET -Headers $headerParams -Uri $listAvailableContentUri
+            if($response.StatusCode -eq 200){
+                $contentResult = ConvertFrom-Json $response.Content
+                $contentResult.Count
+                if($contentResult.Count -gt 0){
+                    $jobs += $contentResult | Start-ThreadJob -ScriptBlock {
+                        $getTokenFunc, $updateTokenFunc, $writeOmsLogFileFunc = $using:functionsDef
+                        ${function:Get-AuthToken} = $getTokenFunc
+                        ${function:Update-AuthToken} = $updateTokenFunc
+                        ${function:Write-OMSLogfile} = $writeOmsLogFileFunc
+                        $headerParams_inner, $expiresOn_inner = Get-AuthToken $env:clientID $env:clientSecret $env:domain $env:tenantGuid
+
+                        #Loop for each Content
+                        foreach($obj in $input){
+                            #Retrieve Content
+                            $headerParams_inner, $expiresOn_inner = Update-AuthToken $headerParams_inner $expiresOn_inner $env:clientID $env:clientSecret $env:domain $env:tenantGuid
+                            $data = Invoke-RestMethod -Method GET -Headers $headerParams_inner -Uri ($obj.contentUri)
+                            #$data.Count
+                            Write-Information -Message "Count = $data.Count"
+                            #Loop through each Record in the Content
+                            foreach($event in $data){
+                                #Filtering for Recrord types
+                                #Get all Record Types
+                                if($env:recordTypes -eq "0"){
+                                    #We dont need Cloud App Security Alerts due to MCAS connector
+                                    if(($event.Source) -ne "Cloud App Security"){
+                                        #Write each event to Log A
+                                        $writeResult = Write-OMSLogfile (Get-Date) $env:customLogName $event $env:workspaceId $env:workspaceKey
+                                        #$writeResult
+                                    }
+                                }
+                                else{
+                                    #Get only certain record types
+                                    $types = ($env:recordTypes).split(",")
+                                    if(($event.RecordType) -in $types){
+                                        #We dont need Cloud App Security Alerts due to MCAS connector
+                                        if(($event.Source) -ne "Cloud App Security"){
+                                            #write each event to Log A
+                                            $writeResult = Write-OMSLogfile (Get-Date) $env:customLogName $event $env:workspaceId $env:workspaceKey
+                                            #$writeResult
+                                        }
+                                    }
+                                    
+                                }
                             }
                         }
-                        
                     }
                 }
             }
             
             #Handles Pagination
-            $nextPageResult = Invoke-WebRequest -Method GET -Headers $headerParams -Uri $listAvailableContentUri
-            If(($nextPageResult.Headers.NextPageUri) -ne $null){
+            #$nextPageResult = Invoke-WebRequest -Method GET -Headers $headerParams -Uri $listAvailableContentUri
+            If(($response.Headers.NextPageUri) -ne $null){
                 $nextPage = $true
-                $listAvailableContentUri = $nextPageResult.Headers.NextPageUri
+                $listAvailableContentUri = $response.Headers.NextPageUri
             }
             Else{$nextPage = $false}
         } until ($nextPage -eq $false)
     }
+    $jobs | Receive-Job -Wait -AutoRemoveJob
 }
 # Get the current universal time in the default string format
 $currentUTCtime = (Get-Date).ToUniversalTime()
@@ -236,19 +290,19 @@ if ($Timer.IsPastDue) {
 $endTime = $currentUTCtime | Get-Date -Format yyyy-MM-ddTHH:mm:ss
 $azstoragestring = $Env:WEBSITE_CONTENTAZUREFILECONNECTIONSTRING
 $Context = New-AzStorageContext -ConnectionString $azstoragestring
-if((Get-AzStorageContainer -Context $Context).Name -contains "lastlog"){
+if((Get-AzStorageContainer -Context $Context).Name -contains "lastlog1"){
     #Set Container
-    $Blob = Get-AzStorageBlob -Context $Context -Container (Get-AzStorageContainer -Name "lastlog" -Context $Context).Name -Blob "lastlog.log"
+    $Blob = Get-AzStorageBlob -Context $Context -Container (Get-AzStorageContainer -Name "lastlog1" -Context $Context).Name -Blob "lastlog1.log"
     $lastlogTime = $blob.ICloudBlob.DownloadText()
     $startTime = $lastlogTime | Get-Date -Format yyyy-MM-ddTHH:mm:ss
-    $endTime | Out-File "$env:TEMP\lastlog.log"
-    Set-AzStorageBlobContent -file "$env:TEMP\lastlog.log" -Container (Get-AzStorageContainer -Name "lastlog" -Context $Context).Name -Context $Context -Force
+    $endTime | Out-File "$env:TEMP\lastlog1.log"
+    Set-AzStorageBlobContent -file "$env:TEMP\lastlog1.log" -Container (Get-AzStorageContainer -Name "lastlog1" -Context $Context).Name -Context $Context -Force
 }
 else {
     #create container
-    $azStorageContainer = New-AzStorageContainer -Name "lastlog" -Context $Context
-    $endTime | Out-File "$env:TEMP\lastlog.log"
-    Set-AzStorageBlobContent -file "$env:TEMP\lastlog.log" -Container $azStorageContainer.name -Context $Context -Force
+    $azStorageContainer = New-AzStorageContainer -Name "lastlog1" -Context $Context
+    $endTime | Out-File "$env:TEMP\lastlog1.log"
+    Set-AzStorageBlobContent -file "$env:TEMP\lastlog1.log" -Container $azStorageContainer.name -Context $Context -Force
     $startTime = $currentUTCtime.AddSeconds(-300) | Get-Date -Format yyyy-MM-ddTHH:mm:ss
 }
 $startTime
@@ -256,8 +310,8 @@ $endTime
 $lastlogTime
 
 
-$headerParams = Get-AuthToken $env:clientID $env:clientSecret $env:domain $env:tenantGuid
-Get-O365Data $startTime $endTime $headerParams $env:tenantGuid
+$headerParams, $expires_on = Get-AuthToken $env:clientID $env:clientSecret $env:domain $env:tenantGuid
+Get-O365Data $startTime $endTime $headerParams $env:tenantGuid $expires_on
 
 
 # Write an information log with the current time.
