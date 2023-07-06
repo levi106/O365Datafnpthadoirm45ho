@@ -223,17 +223,28 @@ function Get-O365Data{
                 Write-Information -Message "Content Count = $($contentResult.Count)"
                 if($contentResult.Count -gt 0){
                     $jobs += $contentResult | Start-ThreadJob -ScriptBlock {
-                        $getTokenFunc, $updateTokenFunc, $writeOmsLogFileFunc = $using:functionsDef
+                        $functionsDefCopy = $using:functionsDef
+                        $getTokenFunc, $updateTokenFunc, $writeOmsLogFileFunc = $functionsDefCopy
                         ${function:Get-AuthToken} = $getTokenFunc
                         ${function:Update-AuthToken} = $updateTokenFunc
                         ${function:Write-OMSLogfile} = $writeOmsLogFileFunc
-                        $headerParams_inner, $expiresOn_inner = Get-AuthToken $env:clientID $env:clientSecret $env:domain $env:tenantGuid
-
+                        $headerParams_outer, $expiresOn_outer = Get-AuthToken $env:clientID $env:clientSecret $env:domain $env:tenantGuid
+                        $sync = [hashtable]::Synchronized(@{})
+                        $sync.headerParams = $headerParams_outer
+                        $sync.expiresOn = $expiresOn_outer
+            
                         #Loop for each Content
-                        foreach($obj in $input){
+                        $input | ForEach-Object -Parallel {
+                            $getTokenFunc, $updateTokenFunc, $writeOmsLogFileFunc = $using:functionsDefCopy
+                            ${function:Get-AuthToken} = $getTokenFunc
+                            ${function:Update-AuthToken} = $updateTokenFunc
+                            ${function:Write-OMSLogfile} = $writeOmsLogFileFunc
+                            $syncCopy = $using:sync
                             #Retrieve Content
-                            $headerParams_inner, $expiresOn_inner = Update-AuthToken $headerParams_inner $expiresOn_inner $env:clientID $env:clientSecret $env:domain $env:tenantGuid
-                            $data = Invoke-RestMethod -Method GET -Headers $headerParams_inner -Uri ($obj.contentUri)
+                            $headerParams_inner, $expiresOn_inner = Update-AuthToken $syncCopy.headerParams $syncCopy.expiresOn $env:clientID $env:clientSecret $env:domain $env:tenantGuid
+                            $syncCopy.headerParams = $headerParams_inner
+                            $syncCopy.expiresOn = $expiresOn_inner
+                            $data = Invoke-RestMethod -Method GET -Headers $headerParams_inner -Uri ($_.contentUri)
                             #$data.Count
                             Write-Information -Message "Record Count = $($data.Count)"
                             #Loop through each Record in the Content
